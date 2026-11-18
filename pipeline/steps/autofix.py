@@ -1,39 +1,153 @@
-"""BƯỚC 2/4 — Sửa tự động những lỗi bắt buộc mà máy sửa được AN TOÀN.   ★★
+from collections import defaultdict
+import yaml
+from ..common import ERROR, parse_yolo_line
 
-Test:  pytest tests/test_autofix.py -q
-
-`fix(ds, issues, cfg) -> list[dict]`: duyệt `issues` (chỉ lỗi severity ERROR), sửa thẳng vào thư mục `ds`,
-và trả về danh sách thay đổi; mỗi phần tử có khoá: image, line, action, before, after
-(đây chính là file `03_fixes.csv` — bằng chứng pipeline đã làm gì, người có thể kiểm lại).
-
-| code lỗi                                       | cách sửa                                    | action           |
-|------------------------------------------------|---------------------------------------------|------------------|
-| BAD_FORMAT, BAD_CLASS_ID, BOX_ZERO, DUP_BOX    | xoá dòng đó khỏi file nhãn                  | "drop_line"      |
-| BOX_OUT_OF_IMAGE                               | cắt box về trong [0,1] (giữ nguyên lớp)     | "clip_box"       |
-| MISSING_LABEL_FILE                             | KHÔNG sửa file (máy không thể bịa nhãn): ghi 1 dòng fix, before="(không có file)", after="chuyển người gán" | "needs_label" |
-| BAD_CLASS_NAME                                 | ghi lại `names` trong data.yaml đúng `cfg["classes"]` | "rename_classes" |
-| DUP_IMAGE_*, LEAK_TEST, CORRUPT_IMAGE, BAD_SIZE| xoá ảnh + nhãn khỏi `ds`                    | "remove_image"   |
-
-Bẫy cần nghĩ tới (có test cho từng cái)
-- Một file có NHIỀU dòng lỗi: số dòng trong `issues` là số dòng GỐC. Nếu xoá từng dòng một thì số dòng lệch.
-  Gom theo file, rồi ghi lại MỘT lần.
-- Sau khi cắt, box có thể không còn diện tích (nằm hẳn ngoài ảnh): lúc đó xoá dòng thay vì ghi box rỗng.
-- Một dòng có 2 lỗi (vd. BOX_OUT_OF_IMAGE + DUP_BOX): xoá dòng thắng, chỉ ghi 1 fix `drop_line`, không ghi thêm `clip_box`. Dòng trống ở giữa file vẫn đếm vào số dòng gốc.
-- Ảnh vừa bị xoá (DUP_IMAGE_*...) mà còn issue dòng của chính nó: bỏ qua êm, không được báo lỗi/chết.
-- Không động tới lỗi WARN (cảnh báo là việc của người). Không sửa file ở `data/raw/` — chỉ sửa `ds`.
-- Chạy lần 2 trên dữ liệu đã sửa phải không làm gì thêm (idempotent) — NGOẠI LỆ duy nhất: `needs_label` được ghi lại mỗi lần còn lỗi `MISSING_LABEL_FILE` (vì ảnh vẫn chưa có nhãn).
-
-- `needs_label` KHÔNG tạo file nhãn rỗng (rỗng = "ảnh nền", khác với "chưa gán"). `review_queue` sẽ đẩy ảnh này lên đầu hàng đợi cho người.
-
-Gợi ý: `yaml.safe_load / safe_dump`.
-"""
-from collections import defaultdict  # noqa: F401
-
-import yaml  # noqa: F401
-
-from ..common import ERROR, parse_yolo_line  # noqa: F401
+DROP_CODES = {"BAD_FORMAT", "BAD_CLASS_ID", "BOX_ZERO", "DUP_BOX"}
+REMOVE_IMG_PREFIXES = ("DUP_IMAGE_", "LEAK_TEST", "CORRUPT_IMAGE", "BAD_SIZE")
 
 
 def fix(ds, issues, cfg):
-    # TODO
-    raise NotImplementedError("autofix chưa làm")
+    fixes = []
+    error_issues = [iss for iss in issues if iss.severity == ERROR]
+
+    # 1. Xử lý lỗi cấp dataset (BAD_CLASS_NAME)
+    for iss in error_issues:
+        if iss.code == "BAD_CLASS_NAME":
+            before_names = ds.yaml_names()
+            after_names = list(cfg["classes"])
+            if ds.yaml_path.exists():
+                data = yaml.safe_load(ds.yaml_path.read_text(encoding="utf-8")) or {}
+            else:
+                data = {}
+            data["names"] = {i: name for i, name in enumerate(after_names)}
+            ds.yaml_path.write_text(yaml.safe_dump(data, allow_unicode=True, sort_keys=False), encoding="utf-8")
+            ds.classes = after_names
+            fixes.append({
+                "image": iss.image or "data.yaml",
+                "line": "",
+                "action": "rename_classes",
+                "before": str(before_names),
+                "after": str(after_names),
+            })
+
+    # 2. Xác định và xoá các ảnh vi phạm nghiêm trọng
+    removed_stems = set()
+    for iss in error_issues:
+        if iss.code.startswith(REMOVE_IMG_PREFIXES):
+            stem = iss.image
+            if stem in removed_stems:
+                continue
+            img_p = ds.image_path(stem)
+            lbl_p = ds.label_path(stem)
+            if img_p is not None and img_p.exists():
+                img_p.unlink()
+                if lbl_p.exists():
+                    lbl_p.unlink()
+                removed_stems.add(stem)
+                fixes.append({
+                    "image": stem,
+                    "line": "",
+                    "action": "remove_image",
+                    "before": stem,
+                    "after": "(đã xoá ảnh và nhãn)",
+                })
+
+    # 3. Xử lý MISSING_LABEL_FILE (không tự tạo file, chỉ ghi log chuyển người gán)
+    logged_missing = set()
+    for iss in error_issues:
+        if iss.code == "MISSING_LABEL_FILE":
+            stem = iss.image
+            if stem not in removed_stems and stem not in logged_missing:
+                logged_missing.add(stem)
+                fixes.append({
+                    "image": stem,
+                    "line": "",
+                    "action": "needs_label",
+                    "before": "(không có file)",
+                    "after": "chuyển người gán",
+                })
+
+    # 4. Gom lỗi cấp dòng theo từng file nhãn
+    line_issues_by_stem = defaultdict(lambda: defaultdict(set))
+    for iss in error_issues:
+        stem = iss.image
+        if stem in removed_stems or iss.line is None:
+            continue
+        if iss.code in DROP_CODES or iss.code == "BOX_OUT_OF_IMAGE":
+            line_issues_by_stem[stem][iss.line].add(iss.code)
+
+    for stem, lines_map in line_issues_by_stem.items():
+        lbl_p = ds.label_path(stem)
+        if not lbl_p.exists():
+            continue
+
+        raw_lines = lbl_p.read_text(encoding="utf-8", errors="replace").splitlines()
+        new_lines = []
+        modified = False
+
+        for line_idx, raw_line in enumerate(raw_lines, start=1):
+            codes = lines_map.get(line_idx)
+            if not codes:
+                new_lines.append(raw_line)
+                continue
+
+            stripped = raw_line.strip()
+            # Ưu tiên drop_line nếu dòng dính cả lỗi xoá lẫn lỗi tràn viền
+            if codes & DROP_CODES:
+                modified = True
+                fixes.append({
+                    "image": stem,
+                    "line": line_idx,
+                    "action": "drop_line",
+                    "before": stripped,
+                    "after": "",
+                })
+                continue
+
+            if "BOX_OUT_OF_IMAGE" in codes:
+                try:
+                    cls_id, cx, cy, w, h = parse_yolo_line(stripped)
+                    x1 = max(0.0, min(1.0, cx - w / 2.0))
+                    y1 = max(0.0, min(1.0, cy - h / 2.0))
+                    x2 = max(0.0, min(1.0, cx + w / 2.0))
+                    y2 = max(0.0, min(1.0, cy + h / 2.0))
+                    nw = x2 - x1
+                    nh = y2 - y1
+
+                    if nw <= 0 or nh <= 0:
+                        modified = True
+                        fixes.append({
+                            "image": stem,
+                            "line": line_idx,
+                            "action": "drop_line",
+                            "before": stripped,
+                            "after": "",
+                        })
+                    else:
+                        ncx = (x1 + x2) / 2.0
+                        ncy = (y1 + y2) / 2.0
+                        after_str = f"{cls_id} {ncx:.6f} {ncy:.6f} {nw:.6f} {nh:.6f}"
+                        new_lines.append(after_str)
+                        modified = True
+                        fixes.append({
+                            "image": stem,
+                            "line": line_idx,
+                            "action": "clip_box",
+                            "before": stripped,
+                            "after": after_str,
+                        })
+                except ValueError:
+                    modified = True
+                    fixes.append({
+                        "image": stem,
+                        "line": line_idx,
+                        "action": "drop_line",
+                        "before": stripped,
+                        "after": "",
+                    })
+
+        if modified:
+            content = "\n".join(new_lines) + ("\n" if new_lines else "")
+            lbl_p.write_text(content, encoding="utf-8")
+
+    return fixes

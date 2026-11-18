@@ -1,0 +1,18 @@
+{
+  "verdict": {
+    "decision": "Hold",
+    "n_errors": 0,
+    "n_warn_images": 38,
+    "n_images": 203,
+    "warn_ratio": 0.1872,
+    "reasons": [
+      "Tỉ lệ ảnh còn cảnh báo là 18.72% (38/203 ảnh), đạt hoặc vượt ngưỡng chặn 10.00%."
+    ]
+  },
+  "reviewed": 80,
+  "budget": 80,
+  "seconds": 6.9,
+  "exported": "D:\\Day09\\K5-L23-Day09-DinhThanhVinh-2A202603044-AutoQC-Pipeline-Lab\\submission\\export\\clean_v1",
+  "config_sha1": "82cd40be4c2f3860a7165a66dd871b568f45296a",
+  "review_sim_sha1": "7988ca22827f780a7043a2300490e679a1697154"
+}
